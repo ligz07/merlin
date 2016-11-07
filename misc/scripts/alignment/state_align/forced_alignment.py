@@ -4,7 +4,7 @@ import time
 from sys import argv, stderr
 from subprocess import check_call, Popen, CalledProcessError, PIPE
 from mean_variance_norm import MeanVarianceNorm
-
+from multiprocessing import Pool
 # string constants for various shell calls
 STATE_NUM=5
 F = str(0.01)
@@ -121,8 +121,12 @@ class ForcedAlignment(object):
         phoneme_dict = {}
         speaker_utt_dict = {}
 
-        for file_id in file_id_list:
-            wav_file = os.path.join(self.wav_dir, file_id + '.wav')
+        for file_id_line in file_id_list:
+            arr = file_id_line.split();
+            wav = arr[1].strip();
+            file_id= arr[0].strip();
+            #wav_file = os.path.join(self.wav_dir, wav)
+            wav_file = wav
             lab_file = os.path.join(self.lab_dir, file_id + '.lab')
             mfc_file = os.path.join(self.mfc_dir, file_id + '.mfc')
             mono_lab_file = os.path.join(self.mono_lab_dir, file_id + '.lab')
@@ -210,7 +214,7 @@ NUMCEPS = 12"""
         # make the new directory
         os.mkdir(self.nxt_dir)
 
-    def prepare_training(self, file_id_list_name, wav_dir, lab_dir, work_dir, multiple_speaker):
+    def prepare_training(self, file_id_list_name, lab_dir, work_dir, multiple_speaker):
 
         print  '---preparing enverionment'
         self.cfg_dir = os.path.join(work_dir, 'config')
@@ -231,7 +235,7 @@ NUMCEPS = 12"""
         self.train_scp = os.path.join(self.cfg_dir, 'train.scp')
         # CFG
         self.cfg = os.path.join(self.cfg_dir, 'cfg')
-    
+
         self.wav_dir = wav_dir
         self.lab_dir = lab_dir
         self.mfc_dir = os.path.join(work_dir, 'mfc')
@@ -241,11 +245,19 @@ NUMCEPS = 12"""
         self.mono_lab_dir = os.path.join(work_dir, 'mono_no_align')
         if not os.path.exists(self.mono_lab_dir):
             os.makedirs(self.mono_lab_dir)
+        
+        self.temp_path = os.path.join(work_dir, 'tmp')
+        if not os.path.exists(self.temp_path):
+            os.makedirs(self.temp_path)
 
+        self.scp_split_dir = os.path.join(self.temp_path, 'scp_split')
+        if not os.path.exists(self.scp_split_dir):
+            os.makedirs(self.scp_split_dir)
+        self.split_per_utterance = 1000
         file_id_list = self._read_file_list(file_id_list_name)
         print  '---checking data'
         speaker_utt_dict = self._check_data(file_id_list, multiple_speaker)
-        
+
         print  '---extracting features'
         self._HCopy()
         print time.strftime("%c")
@@ -255,10 +267,30 @@ NUMCEPS = 12"""
         for key_name in speaker_utt_dict.keys():
             normaliser.feature_normalisation(speaker_utt_dict[key_name], speaker_utt_dict[key_name])  ## save to itself
         print time.strftime("%c")
-        
+
         print  '---making proto'
         self._make_proto()
-        
+    
+    def split_train_scp(self):
+        scp_split_dir = self.scp_split_dir
+        lines = open(self.train_scp)
+        i = 0;
+        part = 1;
+        fp = None
+        filen = os.path.basename(self.train_scp)
+        file_list = []
+        for line in lines:
+            if i % self.split_per_utterance == 0:
+                if not fp == None:
+                   fp.close()
+                fp = open(temp_path+ "/" + filen + ".part" + str(part), "w")
+                file_list.append(temp_path+ "/" + filen + ".part" + str(part))
+                part += 1;
+            fp.write(line);
+            i += 1
+        fp.close()
+        return file_list
+
     def train_hmm(self, niter, num_mix):
         """
         Perform one or more rounds of estimation
@@ -268,18 +300,38 @@ NUMCEPS = 12"""
         print  '---training HMM models'
         done = 0
         mix = 1
+        file_list = self.split_train_scp();
         while mix <= num_mix and done == 0:
-            for i in xrange(niter):
-                next_dir = os.path.join(self.model_dir, 'hmm_mix_' + str(mix) + '_iter_' + str(i+1))
+            for l in xrange(niter):
+                next_dir = os.path.join(self.model_dir, 'hmm_mix_' + str(mix) + '_iter_' + str(l+1))
+                print '---training iteration' + str(l);
                 if not os.path.exists(next_dir):
                     os.makedirs(next_dir)
-                check_call([HERest, '-C', self.cfg, '-S', self.train_scp,
+                i = 1
+                HMMDEFS_file = os.path.join(self.cur_dir, HMMDEFS);
+                p = Pool(len(file_list));
+                for file_i in file_list:
+                    print 'process:' + file_i
+                    p.apply_async(check_call, args=(
+                        [HERest, '-C', self.cfg, '-S', file_i,
                             '-I', self.phoneme_mlf,
                             '-M', next_dir,
                             '-H', os.path.join(self.cur_dir, MACROS),
-                            '-H', os.path.join(self.cur_dir, HMMDEFS),
-                            '-t'] + PRUNING + [self.phonemes],
-                           stdout=PIPE)
+                            '-H', HMMDEFS_file,
+                            '-p', str(i),
+                            '-t'] + PRUNING + [self.phonemes],));
+                    i+=1;
+                p.close();
+                p.join();
+                print "---merge HMM";
+                check_call(" ".join([HERest, '-A',
+                            '-M', next_dir,
+                            '-H', os.path.join(self.cur_dir, MACROS),
+                            '-H', HMMDEFS_file,
+                            '-p', "0",
+                            '-t' ])+" "+ " ".join(PRUNING)+ " " +  " ".join([self.phonemes, next_dir + "/*.acc"]),
+                           stdout=PIPE, shell=True)
+
                 self.cur_dir = next_dir
 
             if mix * 2 <= num_mix:
@@ -292,8 +344,8 @@ NUMCEPS = 12"""
                 next_dir = os.path.join(self.model_dir, 'hmm_mix_' + str(mix * 2) + '_iter_0')
                 if not os.path.exists(next_dir):
                     os.makedirs(next_dir)
-                
-                check_call( [HHEd, '-A', 
+
+                check_call( [HHEd, '-A',
                              '-H', os.path.join(self.cur_dir, MACROS),
                              '-H', os.path.join(self.cur_dir, HMMDEFS),
                              '-M', next_dir] + [hed_file] + [self.phonemes])
@@ -311,7 +363,7 @@ NUMCEPS = 12"""
         print time.strftime("%c")
         self.align_mlf = os.path.join(work_dir, 'mono_align.mlf')
 
-        check_call([HVite, '-a', '-f', '-m', '-y', 'lab', '-o', 'SM', 
+        check_call([HVite, '-a', '-f', '-m', '-y', 'lab', '-o', 'SM',
                     '-i', self.align_mlf, '-L', self.mono_lab_dir,
                     '-C', self.cfg, '-S', self.train_scp,
                     '-H', os.path.join(self.cur_dir, MACROS),
@@ -357,27 +409,28 @@ NUMCEPS = 12"""
 
 if __name__ == '__main__':
 
-    work_dir = os.getcwd()  
+    if (len(sys.argv) < 5):
+        print "need 4 arguments";
+        exit
 
-    wav_dir = os.path.join(work_dir, 'slt_wav')
-    lab_dir = os.path.join(work_dir, 'label_no_align')
-    lab_align_dir = os.path.join(work_dir, 'label_state_align')
+    work_dir = sys.argv[1]
+    lab_dir = sys.argv[2]
+    wave_scp = sys.argv[3]
+    lab_align_dir = sys.argv[4]
 
-    file_id_list_name = os.path.join(work_dir, 'file_id_list.scp')
-    
     ## if multiple_speaker is tuned on. the file_id_list.scp has to reflact this
     ## for example
     ## speaker_1/0001
     ## speaker_2/0001
     ## This is to do speaker-dependent normalisation
-    multiple_speaker = False    
+    multiple_speaker = False
 
     aligner = ForcedAlignment()
-    aligner.prepare_training(file_id_list_name, wav_dir, lab_dir, work_dir, multiple_speaker)
+    aligner.prepare_training(wave_scp, lab_dir, work_dir, multiple_speaker)
 
     aligner.train_hmm(7, 32)
     aligner.align(work_dir, lab_align_dir)
     print   '---done!'
 
 
-    
+
